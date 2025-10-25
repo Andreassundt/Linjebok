@@ -1,157 +1,196 @@
-#!/usr/bin/env python3
 import os
-import sys
 import re
 import json
 import time
 import logging
 from dataclasses import dataclass
-from typing import Optional, Tuple
-
+from datetime import date
+from typing import Optional, List
 import requests
 from bs4 import BeautifulSoup
+from email.message import EmailMessage
+import smtplib
 from dotenv import load_dotenv
 
-# -------- App dir (works for PyInstaller .exe and normal Python) --------
-if getattr(sys, "frozen", False):
-    APP_DIR = os.path.dirname(sys.executable)
-else:
-    APP_DIR = os.path.dirname(os.path.abspath(__file__))
-
 # -------- Config --------
+
 @dataclass
 class Config:
     url: str
     poll_seconds: int
-    state_file: str  # full path
+    state_file: str
+
+    smtp_host: str
+    smtp_port: int
+    smtp_user: str
+    smtp_pass: str
+    smtp_use_tls: bool
+    from_email: str
+    to_emails: List[str]
+    subject_prefix: str
 
 def load_config() -> Config:
     load_dotenv()
-    url = os.getenv(
-        "TARGET_URL",
-        "https://bransch.trafikverket.se/for-dig-i-branschen/jarnvag/Underlag-till-linjebok/Andringar-i-linjebok/",
-    )
-    poll_seconds = int(os.getenv("POLL_SECONDS", "600"))
-    state_name = os.getenv("STATE_FILE", "page_state.json")
-    state_file = state_name if os.path.isabs(state_name) else os.path.join(APP_DIR, state_name)
-    return Config(url=url, poll_seconds=poll_seconds, state_file=state_file)
+    return Config(
+        url=os.getenv("TARGET_URL", "https://bransch.trafikverket.se/for-dig-i-branschen/jarnvag/Underlag-till-linjebok/Andringar-i-linjebok/"),
+        poll_seconds=int(os.getenv("POLL_SECONDS", "600")),
+        state_file=os.getenv("STATE_FILE", "page_state.json"),
 
-# -------- State (now stores last + previous) --------
-def load_state(path: str) -> Tuple[Optional[str], Optional[str]]:
+        smtp_host=os.getenv("SMTP_HOST", "smtp.gmail.com"),
+        smtp_port=int(os.getenv("SMTP_PORT", "587")),
+        smtp_user=os.getenv("SMTP_USER", ""),
+        smtp_pass=os.getenv("SMTP_PASS", ""),
+        smtp_use_tls=os.getenv("SMTP_USE_TLS", "true").lower() in ("1","true","yes"),
+        from_email=os.getenv("FROM_EMAIL", ""),
+        to_emails=[e.strip() for e in os.getenv("TO_EMAILS","").split(",") if e.strip()],
+        subject_prefix=os.getenv("SUBJECT_PREFIX","[Linjebok Watch]"),
+    )
+
+# -------- State --------
+
+def load_last_seen(path: str) -> Optional[List[str]]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        last = data.get("last_seen_updated_date")
-        prev = data.get("previous_seen_updated_date")  # new key
-        return last, prev
+            return data.get("last_seen_changes")
     except FileNotFoundError:
-        return None, None
+        return None
     except Exception as e:
         logging.warning("Could not read state file %s: %s", path, e)
-        return None, None
+        return None
 
-def save_state(path: str, last_iso: str, prev_iso: Optional[str]) -> None:
+def save_last_seen(path: str, entries: List[str]) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "last_seen_updated_date": last_iso,
-                "previous_seen_updated_date": prev_iso,
-            },
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
+        json.dump({"last_seen_changes": entries}, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
+
 # -------- Fetch & parse --------
+
 UA = "Mozilla/5.0 (compatible; LinjebokUpdatedateWatcher/1.0)"
-UPDATED_RE = re.compile(
-    r"Senast\s+uppdaterad\s*/\s*granskad:\s*(\d{4}-\d{2}-\d{2})",
-    re.IGNORECASE
-)
 
 def fetch_html(url: str) -> str:
     r = requests.get(url, headers={"User-Agent": UA}, timeout=30)
     r.raise_for_status()
     return r.text
 
-def extract_updated_date_iso(html: str) -> str:
+def extract_latest_changes(html: str) -> List[str]:
+    """
+    Extracts a list of text entries from the 'Senaste publicerade ändringar' section.
+    Example return:
+    ["2025-10-26 Stockholm, versionsändring",
+     "2025-10-17 Ånge, versionsändring",
+     "2025-10-12 Göteborg, versionsändring"]
+    """
     soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(separator="\n", strip=True).replace("\xa0", " ")
-    m = UPDATED_RE.search(text)
-    if not m:
-        for ln in text.splitlines():
-            if "Senast uppdaterad" in ln:
-                m2 = re.search(r"(\d{4}-\d{2}-\d{2})", ln)
-                if m2:
-                    return m2.group(1)
-        raise RuntimeError("Could not find 'Sist oppdatert' date on page.")
-    return m.group(1)
+    header = soup.find("h3", string=re.compile("Senaste publicerade ändringar", re.I))
+    if not header:
+        raise RuntimeError("Could not find 'Senaste publicerade ändringar' section.")
 
-# -------- Helpers --------
-def fmt_ddmm(iso: Optional[str]) -> str:
-    """Format 'YYYY-MM-DD' -> 'DD/MM' for compact logging."""
-    if not iso:
-        return "unknown"
-    try:
-        y, m, d = iso.split("-")
-        return f"{int(d):02d}/{int(m):02d}"
-    except Exception:
-        return iso  # fallback to raw if unexpected
+    p = header.find_next("p")
+    if not p:
+        raise RuntimeError("Could not find paragraph following the header.")
+
+    text = p.decode_contents().replace("&nbsp;", " ")
+    # Break entries by <br> tags or newlines
+    parts = re.split(r"<br\s*/?>", text)
+    entries = []
+    for part in parts:
+        # Strip HTML tags and normalize spaces
+        clean = re.sub(r"<.*?>", "", part).strip()
+        if clean:
+            entries.append(clean)
+    return entries
+
+
+# -------- Email --------
+
+def send_email(cfg: Config, subject_suffix: str, body: str) -> None:
+    if not (cfg.smtp_user and cfg.smtp_pass and cfg.from_email and cfg.to_emails):
+        raise RuntimeError("SMTP or email addresses not configured. Check your .env.")
+    msg = EmailMessage()
+    msg["From"] = cfg.from_email
+    msg["To"] = ", ".join(cfg.to_emails)
+    msg["Subject"] = f"{cfg.subject_prefix} {subject_suffix}"
+    msg.set_content(body)
+
+    if cfg.smtp_use_tls:
+        with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port, timeout=30) as s:
+            s.starttls()
+            s.login(cfg.smtp_user, cfg.smtp_pass)
+            s.send_message(msg)
+    else:
+        with smtplib.SMTP_SSL(cfg.smtp_host, cfg.smtp_port, timeout=30) as s:
+            s.login(cfg.smtp_user, cfg.smtp_pass)
+            s.send_message(msg)
 
 # -------- Main check --------
-def check_once(cfg: Config, last_seen: Optional[str], prev_seen: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-    html = fetch_html(cfg.url)
-    iso = extract_updated_date_iso(html)
 
-    if not last_seen or iso > last_seen:
-        # Page shows a newer date -> rotate state (prev <- last, last <- iso)
-        logging.info(
-            "UPDATED: %s (prev %s). URL: %s",
-            fmt_ddmm(iso),
-            fmt_ddmm(last_seen),
-            cfg.url,
+def check_once(cfg: Config, last_seen: Optional[List[str]]) -> List[str]:
+    html = fetch_html(cfg.url)
+    entries = extract_latest_changes(html)
+
+    if not entries:
+        logging.warning("No entries found in change list.")
+        return last_seen or []
+
+    if last_seen is None:
+        # First run: initialize
+        save_last_seen(cfg.state_file, entries)
+        logging.info("Initialized with %d entries (latest: %s)", len(entries), entries[0])
+        return entries
+
+    # Identify new entries (usually appear at the top)
+    new_entries = [e for e in entries if e not in last_seen]
+
+    if new_entries:
+        old_first = last_seen[0] if last_seen else "(ingen tidligere oppføring)"
+        new_first = entries[0]
+
+        body = (
+            f"Nye endringer oppdaget på siden.\n\n"
+            f"Nye oppføringer ({len(new_entries)}):\n"
+            + "\n".join(f"- {e}" for e in new_entries)
+            + "\n\n"
+            f"Tidligere første oppføring:\n{old_first}\n"
+            f"Nyeste første oppføring:\n{new_first}\n\n"
+            f"URL: {cfg.url}\n"
         )
-        save_state(cfg.state_file, iso, last_seen)
-        return iso, last_seen
-    else:
-        # No change -> report both current last and previous
-        logging.info(
-            "No change, last updated %s, previous update %s.",
-            fmt_ddmm(last_seen),
-            fmt_ddmm(prev_seen),
-        )
-        return last_seen, prev_seen
+
+        send_email(cfg, subject_suffix=f"{len(new_entries)} nye endringer (nyeste: {new_first.split()[0]})", body=body)
+        logging.info("Emailed %d new entries (latest %s).", len(new_entries), new_first)
+        save_last_seen(cfg.state_file, entries)
+        return entries
+
+    logging.info("Ingen nye endringer siden sist (%s)", entries[0])
+    return last_seen
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = load_config()
-    logging.info("Watching: %s", cfg.url)
-    logging.info("State file: %s", cfg.state_file)
-    logging.info("Interval: %s seconds", cfg.poll_seconds)
+    logging.info("Watching %s", cfg.url)
 
-    last_seen, prev_seen = load_state(cfg.state_file)
+    last_seen = load_last_seen(cfg.state_file)
 
-    # Bootstrap: initialize with current date; no "update" message on first run
+    # Bootstrap: initialize with current page contents (no email)
     if last_seen is None:
-        try:
-            iso = extract_updated_date_iso(fetch_html(cfg.url))
-            save_state(cfg.state_file, iso, None)
-            last_seen, prev_seen = iso, None
-            logging.info("Initialized last_seen to %s", iso)
-        except Exception as e:
-            logging.exception("Failed to initialize state: %s", e)
+        html = fetch_html(cfg.url)
+        entries = extract_latest_changes(html)
+        save_last_seen(cfg.state_file, entries)
+        logging.info("Initialized last_seen with %d entries (latest: %s)", len(entries), entries[0])
+        last_seen = entries
 
     try:
         while True:
             try:
-                last_seen, prev_seen = check_once(cfg, last_seen, prev_seen)
+                last_seen = check_once(cfg, last_seen)
             except Exception as e:
                 logging.exception("Check failed: %s", e)
             time.sleep(cfg.poll_seconds)
     except KeyboardInterrupt:
         logging.info("Stopped by user.")
+
 
 if __name__ == "__main__":
     main()
